@@ -2,6 +2,8 @@ import numpy as np
 import time
 from functools import wraps
 import matplotlib.pyplot as plt
+from abc import ABC, abstractmethod
+import pdb
 
 def timeit(func):
     @wraps(func)
@@ -14,175 +16,202 @@ def timeit(func):
     return wrapper
 
 ''' TODO 
--need to add in a way to do backpropogation
--need to add in the optimiser
- ''' 
+- implement classes for parameters, include the param and the gradient within it
+- implement the optimisers as a class
+- implement hooks/ understand what they are
+''' 
 
 RNG = np.random.default_rng()
 
-class Layer():
-    def __init__(self, indim, outdim, params, function, derivative):
+class Parameter():
+    def __init__(self, weights):
+        self.weights = weights # (out dim, in dim, ...)
+        self.gradient = np.zeros_like(weights)
+    
+    def zero_grad(self):
+        self.gradient.fill(0)
+
+    @property
+    def shape(self):
+        return self.weights.shape
+    
+    @property
+    def size(self):
+        return self.weights.size
+    
+    @classmethod
+    def kaiming(cls, shape):
+        std = np.sqrt(2/shape[1])
+        weights = RNG.normal(0, std, shape)
+        return cls(weights)
+    
+    @classmethod
+    def zeros(cls, shape):
+        return cls(np.zeros(shape, dtype="float32"))
+
+class Layer(ABC):
+    def __init__(self, params):
         self.input = None
         self.output = None
-        self.gradient = None 
-        self.partial = None
-        self.indim = indim
-        self.outdim = outdim 
         self.params = params 
-        self.function = function 
-        self.derivative = derivative 
 
-    def __call__(self, input):
-        out = self.forward(input)
-        self.partial = self.derivative(input)
-        return out
+    @abstractmethod
+    def forward(self, x):
+        pass
 
-    def forward(self, input):
-        self.input = input
-        self.output = self.function(input)
-        return self.output
+    @abstractmethod
+    def backward(self):
+        pass
 
-    def reset(self):
+    def clear(self):
         self.input = None 
         self.output = None
-        self.gradient = None 
-        self.partial = None
-
-    def get_params(self):
-        return self.params
-    
-    def optimise(self):
-        pass
 
 class Affine(Layer):
     def __init__(self, indim, outdim):
-        # Kaiming init 
-        std = (2/indim) ** 0.5
-        self.A = RNG.normal(0, std, (outdim, indim))
-        self.b = RNG.normal(0, std, (outdim))
-        self.A_grad = None
-        self.b_grad = None
+        self.A = Parameter.kaiming((outdim, indim))
+        self.b = Parameter.zeros((outdim))
         params = [self.A, self.b]
-        function = lambda x : np.einsum('ij,kj->ki', self.A, x) + self.b
-        derivative = lambda x : self.A
-        super().__init__(indim, outdim, params, function, derivative)
-    
-    def backward(self, out_grad):
-        self.A_grad = np.einsum('ki,kj->ij', out_grad, self.input)
-        self.b_grad = np.einsum('kj->j', out_grad)
-        in_grad = np.einsum('ki,ij->kj', out_grad, self.A)
-        return in_grad
-    
-    def optimise(self, lr=0.0001):
-        self.A -= lr * self.A_grad
-        self.b -= lr * self.b_grad
+        super().__init__(params)
 
-    def reset(self):
-        super().reset()
-        self.A_grad = None
-        self.b_grad = None 
+    def __call__(self, x):
+        self.forward(x)
+
+    def forward(self, x):
+        self.input = x # (batch, indim)
+        A, b = self.A.weights, self.b.weights
+        self.output = np.einsum('ij,kj->ki', A, x, optimize=True) + b
+        return self.output
+        
+    def backward(self, out_grad):
+        self.A.gradient = np.einsum('ki,kj->ij', out_grad, self.input)
+        self.b.gradient = np.einsum('kj->j', out_grad)
+        in_grad =  out_grad @ self.A.weights
+        self.clear()
+        return in_grad
 
 class Relu(Layer):
-    def __init__(self, dim):
-        params = []
-        function = lambda x : np.maximum(x, 0)
-        derivative = lambda x : np.where(x>0, 1, 0)
-        super().__init__(dim, dim, params, function, derivative)
+    def __init__(self):
+        super().__init__([])
+    
+    def __call__(self, x):
+        self.forward(x)
+
+    def forward(self, x):
+        self.input = x
+        # pdb.set_trace() 
+        self.output = np.maximum(x,0)
+        return self.output
 
     def backward(self, out_grad):
-        return np.einsum('ki,ki->ki', out_grad, self.partial)
+        in_grad = np.einsum('ki,ki->ki', out_grad, np.where(self.input>0, 1, 0))
+        self.clear()
+        return in_grad
     
-class FullyConnected():
-    def __init__(self, indim, outdim):
-        self.seq = [Affine(indim, 64), Relu(64), Affine(64, 64),
-                    Relu(64), Affine(64, outdim)]
+class Sequential():
+    def __init__(self, layers):
+        self.layers = layers
     
     def __call__(self, input):
         return self.forward(input)
     
-    @timeit
+    @property
+    def params(self):
+        params = [p for layer in self.layers for p in layer.params]
+        return params
+    
     def forward(self, input):
         x = input
-        for layer in self.seq:
-            x = layer(x)
+        for layer in self.layers:
+            x = layer.forward(x)
         return x
 
     def backward(self, loss_grad):
         g = loss_grad
-        for layer in reversed(self.seq):
+        for layer in reversed(self.layers):
             g = layer.backward(g)
-
-    def optimise(self):
-        for layer in self.seq:
-            layer.optimise()
-            layer.reset()
     
-class Loss():
-    def __init__(self, function, derivative):
+    def zero_grad(self):
+        for param in self.params:
+            param.zero_grad()
+    
+class Loss(ABC):
+    def __init__(self):
         self.input = None
         self.output = None
-        self.grad = None
-        self.function = function
-        self.derivative = derivative
     
     def __call__(self, x, y):
         loss = self.compute_loss(x, y)
-        self.grad = self.derivative(x, y)
         return loss
     
+    @abstractmethod
     def compute_loss(self, x, y):
-        loss = self.function(x, y)
-        return loss
+        pass
     
+    @abstractmethod
     def backward(self):
-        return self.grad
+        pass
 
 class RMS(Loss):
-    def __init__(self):
-        function = lambda x, y : np.mean((x-y)**2)/2
-        derivative = lambda x, y : (x-y)/x.shape[0]
-        super().__init__(function, derivative)
 
-# fc = FullyConnected(10, 5)
-# ell = RMS()
+    def compute_loss(self, x, y):
+        self.input = (x, y)
+        self.output = np.mean((x-y)**2)/2
+        return self.output
+    
+    def backward(self):
+        x, y = self.input
+        return (x-y)/x.shape[0]
 
-# input = RNG.random((20,10))
-# target = RNG.random((20,5))
+class Optimiser(ABC):
+    def __init__(self, params, lr):
+        self.params = params
+        self.lr = lr
+    
+    @abstractmethod
+    def step(self):
+        pass
 
-# output = fc(input)
-
-# loss = ell(output, target)
-
-# fc.backward(ell.backward())
-
-# fc.optimise()
+class SGD(Optimiser):
+    
+    def step(self):
+        for param in self.params:
+            param.weights += -self.lr * param.gradient
 
 W = RNG.random((5,5))
 b = RNG.random(5)
 x = RNG.random((400,5)) 
 y = np.einsum('ij,ki->ki', W, x) + b
 
-ell = RMS()
-fc = FullyConnected(5,5)
+relu = Relu()
+relu.forward(x)
 
+fc = Sequential([Affine(5, 64), Relu(), Affine(64, 64),
+                    Relu(), Affine(64, 5)])
+ell = RMS()
+optimiser = SGD(fc.params, 0.03)
 losses = []
 
-for epoch in range(100):
-    perm = RNG.permutation(400)
+@timeit
+def train():
+    for epoch in range(100):
+        perm = RNG.permutation(400)
 
-    for start in range(0, 400, 20):
-        batch_idx = perm[start:start+20]
-        x_batch = x[batch_idx]
-        y_batch = y[batch_idx]
+        for start in range(0, 400, 20):
+            batch_idx = perm[start:start+20]
+            x_batch = x[batch_idx]
+            y_batch = y[batch_idx]
 
-        output = fc(x_batch)
-        loss = ell(output, y_batch)
-        fc.backward(ell.backward())
-        fc.optimise()
+            output = fc(x_batch)
+            loss = ell.compute_loss(output, y_batch)
+            fc.backward(ell.backward())
+            optimiser.step()
 
-    full_output = fc(x)
-    full_loss = ell(full_output, y)
-    losses.append(full_loss)
+        full_output = fc(x)
+        full_loss = ell.compute_loss(full_output, y)
+        losses.append(full_loss)
+
+train()
 
 plt.plot(losses)
 plt.show()
