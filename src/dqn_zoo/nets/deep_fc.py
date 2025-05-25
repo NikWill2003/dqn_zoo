@@ -1,4 +1,22 @@
 import numpy as np
+import time
+from functools import wraps
+import matplotlib.pyplot as plt
+
+def timeit(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        end = time.perf_counter()
+        print(f"{func.__name__!r} executed in {end-start:.6f}s")
+        return result
+    return wrapper
+
+''' TODO 
+-need to add in a way to do backpropogation
+-need to add in the optimiser
+ ''' 
 
 RNG = np.random.default_rng()
 
@@ -6,74 +24,165 @@ class Layer():
     def __init__(self, indim, outdim, params, function, derivative):
         self.input = None
         self.output = None
-        self.indim = indim
-        self.outdim = outdim
         self.gradient = None 
+        self.partial = None
+        self.indim = indim
+        self.outdim = outdim 
         self.params = params 
         self.function = function 
         self.derivative = derivative 
 
     def __call__(self, input):
-        return self.forward(input)
+        out = self.forward(input)
+        self.partial = self.derivative(input)
+        return out
 
     def forward(self, input):
         self.input = input
         self.output = self.function(input)
         return self.output
 
-    def backward(self):
-        self.gradient = self.derivative(self.input)
-        return self.gradient
-
     def reset(self):
         self.input = None 
+        self.output = None
         self.gradient = None 
+        self.partial = None
 
     def get_params(self):
         return self.params
+    
+    def optimise(self):
+        pass
 
 class Affine(Layer):
     def __init__(self, indim, outdim):
         # Kaiming init 
         std = (2/indim) ** 0.5
-        A = RNG.normal(0, std, (outdim, indim))
-        b = RNG.normal(0, std, (outdim))
-        params = [A, b]
-        function = lambda x : np.matmul(A, x) + b
-        derivative = lambda x : A
+        self.A = RNG.normal(0, std, (outdim, indim))
+        self.b = RNG.normal(0, std, (outdim))
+        self.A_grad = None
+        self.b_grad = None
+        params = [self.A, self.b]
+        function = lambda x : np.einsum('ij,kj->ki', self.A, x) + self.b
+        derivative = lambda x : self.A
         super().__init__(indim, outdim, params, function, derivative)
-        
+    
+    def backward(self, out_grad):
+        self.A_grad = np.einsum('ki,kj->ij', out_grad, self.input)
+        self.b_grad = np.einsum('kj->j', out_grad)
+        in_grad = np.einsum('ki,ij->kj', out_grad, self.A)
+        return in_grad
+    
+    def optimise(self, lr=0.0001):
+        self.A -= lr * self.A_grad
+        self.b -= lr * self.b_grad
+
+    def reset(self):
+        super().reset()
+        self.A_grad = None
+        self.b_grad = None 
 
 class Relu(Layer):
     def __init__(self, dim):
         params = []
         function = lambda x : np.maximum(x, 0)
-        derivative = lambda x : 1 if x > 0 else 0
+        derivative = lambda x : np.where(x>0, 1, 0)
         super().__init__(dim, dim, params, function, derivative)
 
+    def backward(self, out_grad):
+        return np.einsum('ki,ki->ki', out_grad, self.partial)
+    
 class FullyConnected():
     def __init__(self, indim, outdim):
-        self.a1 = Affine(indim, 64)
-        self.r1 = Relu(64)
-        self.a2 = Affine(64, 64)
-        self.r2 = Relu(64)
-        self.a3 = Affine(64, outdim)
+        self.seq = [Affine(indim, 64), Relu(64), Affine(64, 64),
+                    Relu(64), Affine(64, outdim)]
     
     def __call__(self, input):
         return self.forward(input)
     
+    @timeit
     def forward(self, input):
-        x = self.r1(self.a1(input))
-        x = self.r2(self.a2(x))
-        logits = self.a3(x)
-        return logits
+        x = input
+        for layer in self.seq:
+            x = layer(x)
+        return x
 
-affine = Affine(2,3)
-print(affine.get_params())
-input = np.ones(2)
-print(affine(input))
+    def backward(self, loss_grad):
+        g = loss_grad
+        for layer in reversed(self.seq):
+            g = layer.backward(g)
 
-# input = 10* RNG.random(3) - 5
-# relu = Relu(3)
-# print(input)
-# print(relu.forward(input))
+    def optimise(self):
+        for layer in self.seq:
+            layer.optimise()
+            layer.reset()
+    
+class Loss():
+    def __init__(self, function, derivative):
+        self.input = None
+        self.output = None
+        self.grad = None
+        self.function = function
+        self.derivative = derivative
+    
+    def __call__(self, x, y):
+        loss = self.compute_loss(x, y)
+        self.grad = self.derivative(x, y)
+        return loss
+    
+    def compute_loss(self, x, y):
+        loss = self.function(x, y)
+        return loss
+    
+    def backward(self):
+        return self.grad
+
+class RMS(Loss):
+    def __init__(self):
+        function = lambda x, y : np.mean((x-y)**2)/2
+        derivative = lambda x, y : (x-y)/x.shape[0]
+        super().__init__(function, derivative)
+
+# fc = FullyConnected(10, 5)
+# ell = RMS()
+
+# input = RNG.random((20,10))
+# target = RNG.random((20,5))
+
+# output = fc(input)
+
+# loss = ell(output, target)
+
+# fc.backward(ell.backward())
+
+# fc.optimise()
+
+W = RNG.random((5,5))
+b = RNG.random(5)
+x = RNG.random((400,5)) 
+y = np.einsum('ij,ki->ki', W, x) + b
+
+ell = RMS()
+fc = FullyConnected(5,5)
+
+losses = []
+
+for epoch in range(100):
+    perm = RNG.permutation(400)
+
+    for start in range(0, 400, 20):
+        batch_idx = perm[start:start+20]
+        x_batch = x[batch_idx]
+        y_batch = y[batch_idx]
+
+        output = fc(x_batch)
+        loss = ell(output, y_batch)
+        fc.backward(ell.backward())
+        fc.optimise()
+
+    full_output = fc(x)
+    full_loss = ell(full_output, y)
+    losses.append(full_loss)
+
+plt.plot(losses)
+plt.show()
